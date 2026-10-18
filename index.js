@@ -20,6 +20,8 @@ const chatMessages = []; // simple array store
 const shopCatalog = []; // full catalog
 let activeShop = { start: null, end: null, items: [] };
 const lobbies = new Map(); // lobbyId -> lobby meta
+const bans = new Set(); // userId bans
+const mutes = new Map(); // userId -> mutedUntil
 
 // Seed promo code 4110 as unlimited
 promoCodes.set('4110', { code: '4110', unlimited: true, created_at: new Date().toISOString() });
@@ -38,7 +40,9 @@ function getOrCreateUser(googleId, displayName, email) {
     created_at: new Date().toISOString(),
     is_full_unlocked: false,
     trial_expires_at: null,
-    redeemed_codes: []
+    redeemed_codes: [],
+    avatar_url: null,
+    purchases: []
   };
   users.set(id, user);
   return user;
@@ -98,6 +102,28 @@ app.get('/api/profile/:userId', (req, res) => {
   return res.json({ success: true, user: { ...user, trial_active: trialActive } });
 });
 
+// ---------- Avatar upload (signed URL placeholder) ----------
+app.post('/api/avatar/request-upload', (req, res) => {
+  // body: { userId, fileName }
+  const { userId, fileName } = req.body;
+  const user = users.get(userId);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  // In production: generate signed URL from S3 / GCS and return to client. Here we return a placeholder URL.
+  const uploadUrl = `https://storage.example.com/uploads/${userId}/${fileName}?signed=PLACEHOLDER`;
+  const accessUrl = `https://cdn.example.com/uploads/${userId}/${fileName}`;
+  return res.json({ success: true, uploadUrl, accessUrl });
+});
+
+app.post('/api/avatar/confirm', (req, res) => {
+  // body: { userId, accessUrl }
+  const { userId, accessUrl } = req.body;
+  const user = users.get(userId);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  user.avatar_url = accessUrl;
+  users.set(userId, user);
+  return res.json({ success: true, user });
+});
+
 // ---------- Shop catalog & active rotation ----------
 // Simple catalog seed
 function seedCatalog() {
@@ -112,6 +138,20 @@ seedCatalog();
 // Endpoint to get active shop
 app.get('/api/shop/active', (req, res) => {
   return res.json({ success: true, activeShop });
+});
+
+// Purchase stub: in production validate Play Billing purchase token server-side
+app.post('/api/shop/purchase', (req, res) => {
+  // body: { userId, itemId, platformPurchaseToken (optional) }
+  const { userId, itemId } = req.body;
+  const user = users.get(userId);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  const item = shopCatalog.find(i => i.id === itemId);
+  if (!item) return res.status(404).json({ error: 'item not found' });
+  // For now just record purchase
+  user.purchases.push({ itemId, purchased_at: new Date().toISOString() });
+  users.set(userId, user);
+  return res.json({ success: true, purchase: { itemId } });
 });
 
 // Force-rotate (admin) - for dev only
@@ -150,6 +190,11 @@ app.post('/api/chat/send', (req, res) => {
   if (!channel || !userId || !message) return res.status(400).json({ error: 'channel,userId,message required' });
   const user = users.get(userId);
   if (!user) return res.status(404).json({ error: 'user not found' });
+  if (bans.has(userId)) return res.status(403).json({ error: 'user banned' });
+
+  // Check mutes
+  const muteUntil = mutes.get(userId);
+  if (muteUntil && new Date(muteUntil) > new Date()) return res.status(403).json({ error: 'user muted' });
 
   // Basic moderation: block messages that contain banned words
   const banned = ['badword1','badword2'];
@@ -168,6 +213,25 @@ app.get('/api/chat/history/:channel', (req, res) => {
   return res.json({ success: true, messages: history });
 });
 
+// Moderation admin endpoints (dev only) - mute/ban
+app.post('/api/moderation/ban', (req, res) => {
+  // body: { adminKey, userId }
+  const { adminKey, userId } = req.body;
+  // In production: verify adminKey properly
+  if (adminKey !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'not authorized' });
+  bans.add(userId);
+  return res.json({ success: true });
+});
+
+app.post('/api/moderation/mute', (req, res) => {
+  // body: { adminKey, userId, minutes }
+  const { adminKey, userId, minutes } = req.body;
+  if (adminKey !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'not authorized' });
+  const until = new Date(new Date().getTime() + (minutes||60)*60000).toISOString();
+  mutes.set(userId, until);
+  return res.json({ success: true, mutedUntil: until });
+});
+
 // ---------- Matchmaking / Lobby quick search & invites ----------
 app.post('/api/lobby/create', (req, res) => {
   // body: { hostUserId, mode (1v1/2v2...), mapId }
@@ -183,6 +247,7 @@ app.post('/api/lobby/join', (req, res) => {
   const { lobbyId, userId } = req.body;
   const lobby = lobbies.get(lobbyId);
   if (!lobby) return res.status(404).json({ error: 'lobby not found' });
+  if (lobby.players.includes(userId)) return res.json({ success: true, lobby });
   lobby.players.push(userId);
   lobbies.set(lobbyId, lobby);
   return res.json({ success: true, lobby });
